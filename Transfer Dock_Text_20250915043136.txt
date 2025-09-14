@@ -1,0 +1,159 @@
+#include "BluetoothSerial.h"
+#include <Wire.h>
+#include <EEPROM.h>
+#include <TFT_eSPI.h>
+
+BluetoothSerial SerialBT;
+TFT_eSPI tft = TFT_eSPI();
+
+// Motor Pins
+const int IN1 = 26; // Forward
+const int IN2 = 27; // Backward
+
+// LED Pins
+const int LED_FORWARD = 14;
+const int LED_BACKWARD = 12;
+const int LED_CHARGING = 13;
+const int LED_SLEEP = 25;
+
+// Buzzer Pin
+const int BUZZER_PIN = 33;
+
+// Motor pulse duration
+const int MOTOR_PULSE = 100; // 100ms
+
+// EEPROM Password
+const int EEPROM_ADDR = 0;
+String password = "252525"; // Default password
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("DoorLockESP32");
+
+  // Motor pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  // LED pins
+  pinMode(LED_FORWARD, OUTPUT);
+  pinMode(LED_BACKWARD, OUTPUT);
+  pinMode(LED_CHARGING, OUTPUT);
+  pinMode(LED_SLEEP, OUTPUT);
+  digitalWrite(LED_FORWARD, LOW);
+  digitalWrite(LED_BACKWARD, LOW);
+  digitalWrite(LED_CHARGING, LOW);
+  digitalWrite(LED_SLEEP, HIGH);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // TFT
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawString("Door Lock Ready", 10, 10);
+
+  // EEPROM
+  EEPROM.begin(64);
+}
+
+// Password functions
+bool checkPassword(String input) {
+  String storedPass = "";
+  for(int i=0; i<6; i++) {
+    storedPass += char(EEPROM.read(EEPROM_ADDR + i));
+  }
+  return input == storedPass;
+}
+
+void changePassword(String newPass) {
+  for(int i=0; i<newPass.length(); i++) {
+    EEPROM.write(EEPROM_ADDR + i, newPass[i]);
+  }
+  EEPROM.commit();
+  password = newPass;
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Password Changed", 10, 10);
+}
+
+// Motor functions
+void motorForward() {
+  digitalWrite(LED_FORWARD, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  delay(MOTOR_PULSE);
+  digitalWrite(IN1, LOW);
+  digitalWrite(LED_FORWARD, LOW);
+}
+
+void motorBackward() {
+  digitalWrite(LED_BACKWARD, HIGH);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  delay(MOTOR_PULSE);
+  digitalWrite(IN2, LOW);
+  digitalWrite(LED_BACKWARD, LOW);
+}
+
+// Buzzer
+void buzzerAlert() {
+  for(int i=0; i<3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// Bluetooth handler
+void handleBluetooth() {
+  if(SerialBT.available()) {
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+
+    if(cmd.startsWith("PASS:")) {
+      String newPass = cmd.substring(5);
+      changePassword(newPass);
+    } else if(cmd.startsWith("CHECK:")) {
+      String passInput = cmd.substring(6);
+      if(checkPassword(passInput)) {
+        buzzerAlert();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Password Correct", 10, 10);
+      } else {
+        buzzerAlert();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Wrong Password", 10, 10);
+      }
+    } else if(cmd == "LOCK") {
+      motorForward();
+      tft.fillScreen(TFT_BLACK);
+      tft.drawString("Door Locked", 10, 10);
+    } else if(cmd == "UNLOCK") {
+      motorBackward();
+      tft.fillScreen(TFT_BLACK);
+      tft.drawString("Door Unlocked", 10, 10);
+    }
+  }
+}
+
+// Wi-Fi placeholder
+void handleWiFi() {
+  // Future web server commands: LOCK, UNLOCK, PASS
+}
+
+void loop() {
+  handleBluetooth();
+  handleWiFi();
+
+  // Sleep LED blinking
+  digitalWrite(LED_SLEEP, HIGH);
+  delay(1000);
+  digitalWrite(LED_SLEEP, LOW);
+  delay(1000);
+}
