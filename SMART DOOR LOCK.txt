@@ -1,0 +1,243 @@
+#include "BluetoothSerial.h"
+#include <Wire.h>
+#include <EEPROM.h>
+#include <TFT_eSPI.h>
+
+BluetoothSerial SerialBT;
+TFT_eSPI tft = TFT_eSPI();
+
+// Motor Pins
+const int IN1 = 5;   // Forward (LOCK)
+const int IN2 = 18;  // Backward (UNLOCK)
+const int MOTOR_PULSE = 100; // 100ms pulse
+
+// Button Pins
+const int BUTTON_LOCK = 12;    // Lock button pin
+const int BUTTON_UNLOCK = 13;  // Unlock button pin
+
+// LED Pins
+const int LED_FORWARD = 2;
+const int LED_BACKWARD = 4;
+const int LED_CHARGING = 15;
+const int LED_SLEEP = 21;
+
+// Buzzer
+const int BUZZER_PIN = 19;
+
+// EEPROM Password
+const int EEPROM_ADDR = 0;
+String password = "252525"; // Default password
+
+// OTP
+String currentOTP = "000000";
+
+// Authentication & Freeze
+bool authenticated = false;
+unsigned long freezeStart = 0;
+bool isFrozen = false;
+const unsigned long freezeDuration = 5UL * 60UL * 1000UL; // 5 minutes
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("DoorLockESP32");
+  SerialBT.setPin("1234"); // Default Bluetooth PIN
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  // Button pins
+  pinMode(BUTTON_LOCK, INPUT_PULLUP);
+  pinMode(BUTTON_UNLOCK, INPUT_PULLUP);
+
+  pinMode(LED_FORWARD, OUTPUT);
+  pinMode(LED_BACKWARD, OUTPUT);
+  pinMode(LED_CHARGING, OUTPUT);
+  pinMode(LED_SLEEP, OUTPUT);
+  digitalWrite(LED_FORWARD, LOW);
+  digitalWrite(LED_BACKWARD, LOW);
+  digitalWrite(LED_CHARGING, LOW);
+  digitalWrite(LED_SLEEP, HIGH);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.drawString("Door Lock Ready", 10, 10);
+
+  EEPROM.begin(64);
+
+  // Load password from EEPROM
+  if (EEPROM.read(EEPROM_ADDR) == 0xFF) {
+    changePassword(password);
+  } else {
+    String storedPass = "";
+    for (int i = 0; i < 6; i++) storedPass += char(EEPROM.read(EEPROM_ADDR + i));
+    password = storedPass;
+  }
+
+  generateNewOTP();
+}
+
+// ---------------- Password Functions ----------------
+bool checkPassword(String input) {
+  return input == password;
+}
+
+void changePassword(String newPass) {
+  for (int i = 0; i < newPass.length(); i++) EEPROM.write(EEPROM_ADDR + i, newPass[i]);
+  EEPROM.commit();
+  password = newPass;
+  tft.fillScreen(TFT_BLACK);
+  tft.drawString("Password Changed", 10, 10);
+  SerialBT.println("Password Changed Successfully");
+}
+
+// ---------------- Motor ----------------
+void motorForward() {
+  digitalWrite(LED_FORWARD, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  delay(MOTOR_PULSE);
+  digitalWrite(IN1, LOW);
+  digitalWrite(LED_FORWARD, LOW);
+}
+
+void motorBackward() {
+  digitalWrite(LED_BACKWARD, HIGH);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  delay(MOTOR_PULSE);
+  digitalWrite(IN2, LOW);
+  digitalWrite(LED_BACKWARD, LOW);
+}
+
+// ---------------- Buzzer ----------------
+void buzzerAlert() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// ---------------- OTP ----------------
+String generateRandomOTP() {
+  String otp = "";
+  for (int i = 0; i < 6; i++) otp += String(random(0, 10));
+  return otp;
+}
+
+void generateNewOTP() {
+  currentOTP = generateRandomOTP();
+  SerialBT.println("New OTP: " + currentOTP);
+}
+
+// ---------------- Bluetooth Handler ----------------
+void handleBluetooth() {
+  if (isFrozen) {
+    if (millis() - freezeStart >= freezeDuration) isFrozen = false;
+    else return;
+  }
+
+  if (SerialBT.available()) {
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.startsWith("PASS:")) {
+      changePassword(cmd.substring(5));
+    } 
+    else if (cmd.startsWith("CHECK:")) {
+      String passInput = cmd.substring(6);
+      if (checkPassword(passInput)) {
+        buzzerAlert();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Password Correct", 10, 10);
+        authenticated = true;
+        generateNewOTP();
+      } else {
+        buzzerAlert();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Wrong Password", 10, 10);
+        authenticated = false;
+        isFrozen = true;
+        freezeStart = millis();
+      }
+    } 
+    else if (authenticated) {
+      if (cmd == "LOCK") {
+        motorForward();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Door Locked", 10, 10);
+      } 
+      else if (cmd == "UNLOCK") {
+        motorBackward();
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Door Unlocked", 10, 10);
+      } 
+      else if (cmd.startsWith("OTP:")) {
+        String otpInput = cmd.substring(4);
+        if (otpInput == currentOTP) {
+          buzzerAlert();
+          tft.fillScreen(TFT_BLACK);
+          tft.drawString("OTP Correct", 10, 10);
+          authenticated = false;
+        } else {
+          buzzerAlert();
+          tft.fillScreen(TFT_BLACK);
+          tft.drawString("OTP Wrong", 10, 10);
+          tft.drawString("New OTP Generated", 10, 40);
+          authenticated = false;
+          generateNewOTP();
+          isFrozen = true;
+          freezeStart = millis();
+        }
+      }
+    } 
+    else {
+      SerialBT.println("Enter password first using CHECK:command");
+    }
+  }
+}
+
+// ---------------- Button Handler ----------------
+void handleButtons() {
+  if (digitalRead(BUTTON_LOCK) == LOW) { // Lock button pressed
+    motorForward();
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Door Locked (Button)", 10, 10);
+    buzzerAlert();
+    delay(300); // debounce
+  }
+  if (digitalRead(BUTTON_UNLOCK) == LOW) { // Unlock button pressed
+    motorBackward();
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("Door Unlocked (Button)", 10, 10);
+    buzzerAlert();
+    delay(300); // debounce
+  }
+}
+
+// ---------------- Wi-Fi Placeholder ----------------
+void handleWiFi() {
+  // Future Web server: LOCK, UNLOCK, PASS
+}
+
+// ---------------- Main Loop ----------------
+void loop() {
+  handleBluetooth();
+  handleWiFi();
+  handleButtons(); // Physical button check
+  // Sleep LED blinking
+  digitalWrite(LED_SLEEP, HIGH);
+  delay(1000);
+  digitalWrite(LED_SLEEP, LOW);
+  delay(1000);
+}
