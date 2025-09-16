@@ -1,33 +1,3 @@
-Irfan Smart Door Lock
-
-Overview
-
-This project is a smart door lock using ESP32 WROOM 38-pin with:
-
-L9110S motor driver (100ms pulses, dual plastic gear)
-
-4 LEDs (Forward, Backward, Charging/Battery, Sleep)
-
-Buzzer (Tik-tik-tik alert)
-
-TFT Display (Bina SD card, shows status & battery)
-
-Password management + OTP-ready
-
-Bluetooth + Wi-Fi dual connectivity
-
-Modular & expandable code
-
-One-time upload ready for phone / Droid app
-
-
-Wiring Diagram
-
-See wiring/WiringDiagram.png for connections.
-
-Features
-
-1. Motor Forward/Backward (Lock/Unlock)
 
 
 2. LEDs feedback
