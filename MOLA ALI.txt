@@ -1,0 +1,316 @@
+#include "BluetoothSerial.h"
+#include <WiFi.h>
+#include <esp_sleep.h>
+#include <EEPROM.h>
+#include "esp_bt_device.h"
+#include "esp_bt_main.h"
+
+BluetoothSerial SerialBT;
+
+// Motor Pins for L9110S
+const int A_IA = 5;   // IN1 for Motor A (GPIO5)
+const int A_IB = 18;  // IN2 for Motor A (GPIO18)
+unsigned long MOTOR_RUN_TIME = 0;
+
+// LED Pins
+const int LED_FORWARD = 2;
+const int LED_BACKWARD = 4;
+const int LED_SLEEP = 21;
+const int CHARGING_LED_PIN = 26; // Naya LED pin (GPIO26)
+
+// Buttons
+const int LOCK_BUTTON = 32;
+const int UNLOCK_BUTTON = 33;
+
+// Buzzer
+const int BUZZER_PIN = 19;
+
+// Bluetooth and WiFi Security
+const char* BLUETOOTH_PIN = "1234";
+const char* WIFI_PIN = "48364836";
+
+// WiFi AP Settings
+const char* ssid = "ESP32_DoorLock";
+const char* password = WIFI_PIN;
+
+// EEPROM Variables
+const int EEPROM_SIZE = 4;
+const int EEPROM_ADDR_MOTOR_TIME = 0;
+
+// Motor state variables
+volatile bool lockRequested = false;
+volatile bool unlockRequested = false;
+unsigned long motorStartTime = 0;
+bool isMotorRunning = false;
+String currentDirection = "";
+
+// Naya State Variable
+String lockState = "UNLOCKED";
+
+// Sleep mode variables
+bool isSleepMode = false;
+unsigned long lastActivityTime = 0;
+const unsigned long SLEEP_TIMEOUT = 300000;
+
+// Authentication variables
+bool authenticated = false;
+unsigned long authTime = 0;
+const unsigned long AUTH_TIMEOUT = 60000;
+
+// Charging LED variables
+unsigned long lastBlinkTime = 0;
+const unsigned long BLINK_INTERVAL = 500;
+
+// ---------------- Helper Functions -----------------
+void beepBuzzer(int beeps) {
+  for(int i = 0; i < beeps; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    if(i < beeps-1) delay(100);
+  }
+}
+
+void startMotor(bool isLock) {
+  if (isLock) {
+    digitalWrite(A_IA, HIGH);
+    digitalWrite(A_IB, LOW);
+    digitalWrite(LED_FORWARD, HIGH);
+    digitalWrite(LED_BACKWARD, LOW);
+    currentDirection = "LOCK";
+    SerialBT.println("STATUS:LOCKING");
+    lockState = "TRANSITIONING";
+  } else {
+    digitalWrite(A_IA, LOW);
+    digitalWrite(A_IB, HIGH);
+    digitalWrite(LED_FORWARD, LOW);
+    digitalWrite(LED_BACKWARD, HIGH);
+    currentDirection = "UNLOCK";
+    SerialBT.println("STATUS:UNLOCKING");
+    lockState = "TRANSITIONING";
+  }
+  
+  motorStartTime = millis();
+  isMotorRunning = true;
+}
+
+void stopMotor() {
+  digitalWrite(A_IA, LOW);
+  digitalWrite(A_IB, LOW);
+  digitalWrite(LED_FORWARD, LOW);
+  digitalWrite(LED_BACKWARD, LOW);
+  isMotorRunning = false;
+  beepBuzzer(5);
+  SerialBT.println("STATUS:COMPLETED");
+  if (currentDirection == "LOCK") {
+    lockState = "LOCKED";
+    SerialBT.println("Door Locked");
+  } else {
+    lockState = "UNLOCKED";
+    SerialBT.println("Door Unlocked");
+  }
+}
+
+void updateSleepLED() {
+  if(isSleepMode) {
+    digitalWrite(LED_SLEEP, HIGH);
+  } else {
+    static unsigned long lastBlink = 0;
+    if (millis() - lastBlink > 1000) {
+      digitalWrite(LED_SLEEP, !digitalRead(LED_SLEEP));
+      lastBlink = millis();
+    }
+  }
+}
+
+void enterSleepMode() {
+  if(isMotorRunning) return;
+  
+  Serial.println("Entering Sleep Mode...zzz");
+  beepBuzzer(1);
+  
+  stopMotor();
+  digitalWrite(LED_SLEEP, HIGH);
+  
+  SerialBT.end();
+  WiFi.softAPdisconnect(true);
+  delay(100);
+  
+  isSleepMode = true;
+  
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LOCK_BUTTON, LOW);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)UNLOCK_BUTTON, LOW);
+  
+  esp_light_sleep_start();
+}
+
+void wakeFromSleep() {
+  SerialBT.begin("SecureDoorLock");
+  
+  WiFi.softAP(ssid, password);
+  
+  isSleepMode = false;
+  lastActivityTime = millis();
+  authenticated = false;
+  
+  Serial.println("Device Woke Up!");
+  beepBuzzer(1);
+}
+
+// ----------------- Setup -----------------
+void setup() {
+  delay(1000);
+  
+  Serial.begin(115200);
+  
+  pinMode(A_IA, OUTPUT);
+  pinMode(A_IB, OUTPUT);
+  digitalWrite(A_IA, LOW);
+  digitalWrite(A_IB, LOW);
+
+  pinMode(LED_FORWARD, OUTPUT);
+  pinMode(LED_BACKWARD, OUTPUT);
+  pinMode(LED_SLEEP, OUTPUT);
+  pinMode(CHARGING_LED_PIN, OUTPUT); // Naya pin define kiya
+
+  pinMode(LOCK_BUTTON, INPUT_PULLUP);
+  pinMode(UNLOCK_BUTTON, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  SerialBT.begin("SecureDoorLock");
+
+  WiFi.softAP(ssid, password);
+
+  EEPROM.begin(EEPROM_SIZE);
+  // --- Yeh code ki do lines sirf ek baar daalni hai, emergency erase ke liye ---
+  EEPROM.put(EEPROM_ADDR_MOTOR_TIME, (unsigned long)0);
+  EEPROM.commit();
+  // -----------------------------------------------------------------------------
+  EEPROM.get(EEPROM_ADDR_MOTOR_TIME, MOTOR_RUN_TIME);
+  
+  if (MOTOR_RUN_TIME == 0 || MOTOR_RUN_TIME > 60000) {
+    MOTOR_RUN_TIME = 8000;
+    EEPROM.put(EEPROM_ADDR_MOTOR_TIME, MOTOR_RUN_TIME);
+    EEPROM.commit();
+  }
+  
+  if(esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+    wakeFromSleep();
+  }
+  
+  Serial.println("Device Ready");
+  Serial.print("Current motor run time (ms): ");
+  Serial.println(MOTOR_RUN_TIME);
+  beepBuzzer(2);
+}
+
+// ----------------- Main Loop -----------------
+void loop() {
+  // Naya code: Charging LED ke liye
+  static unsigned long lastBlinkTime = 0;
+  if(millis() - lastBlinkTime >= BLINK_INTERVAL) {
+    digitalWrite(CHARGING_LED_PIN, !digitalRead(CHARGING_LED_PIN));
+    lastBlinkTime = millis();
+  }
+  
+  if(!isSleepMode && (millis() - lastActivityTime > SLEEP_TIMEOUT)) {
+    enterSleepMode();
+  }
+
+  if(authenticated && (millis() - authTime > AUTH_TIMEOUT)) {
+    authenticated = false;
+    SerialBT.println("Authentication timeout. Please send PIN again.");
+  }
+
+  if (SerialBT.available()) {
+    lastActivityTime = millis();
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+    
+    if(!authenticated) {
+      if(cmd == BLUETOOTH_PIN) {
+        authenticated = true;
+        authTime = millis();
+        SerialBT.println("AUTH_SUCCESS");
+        beepBuzzer(2);
+      } else {
+        SerialBT.println("AUTH_REQUIRED");
+        beepBuzzer(1);
+      }
+    } else {
+      // Yahan humne naya logic lagaya hai
+      if (cmd == "LOCK" && lockState == "UNLOCKED") {
+        lockRequested = true;
+        SerialBT.println("Lock request accepted.");
+      }
+      else if (cmd == "UNLOCK" && lockState == "LOCKED") {
+        unlockRequested = true;
+        SerialBT.println("Unlock request accepted.");
+      }
+      else if (cmd.startsWith("TIME:")) {
+        long newTime = cmd.substring(5).toInt();
+        if (newTime > 0 && newTime <= 60000) {
+          MOTOR_RUN_TIME = newTime;
+          EEPROM.put(EEPROM_ADDR_MOTOR_TIME, MOTOR_RUN_TIME);
+          EEPROM.commit();
+          SerialBT.print("Run time set to: ");
+          SerialBT.print(MOTOR_RUN_TIME / 1000);
+          SerialBT.println(" seconds and saved permanently.");
+        }
+      }
+      else if (cmd == "SLEEP") enterSleepMode();
+      else if (cmd == "WAKE") wakeFromSleep();
+      else if (cmd == "ERASE") {
+        // Naya ERASE command
+        EEPROM.put(EEPROM_ADDR_MOTOR_TIME, (unsigned long)0);
+        EEPROM.commit();
+        MOTOR_RUN_TIME = 8000;
+        SerialBT.println("Motor run time has been reset to default (8 seconds). Please send TIME:xxxx command again.");
+      }
+      else {
+        SerialBT.println("Invalid command or lock is already in the requested state.");
+      }
+    }
+  }
+
+  // Check physical buttons
+  if (digitalRead(LOCK_BUTTON) == LOW) {
+    delay(50);
+    if (digitalRead(LOCK_BUTTON) == LOW && lockState == "UNLOCKED") {
+      lockRequested = true;
+      lastActivityTime = millis();
+    }
+  }
+
+  if (digitalRead(UNLOCK_BUTTON) == LOW) {
+    delay(50);
+    if (digitalRead(UNLOCK_BUTTON) == LOW && lockState == "LOCKED") {
+      unlockRequested = true;
+      lastActivityTime = millis();
+    }
+  }
+
+  // Process motor requests
+  if ((lockRequested || unlockRequested) && !isMotorRunning && !isSleepMode) {
+    if (lockRequested) {
+      startMotor(true);
+      lockRequested = false;
+      SerialBT.println("Door Locking...");
+    } else {
+      startMotor(false);
+      unlockRequested = false;
+      SerialBT.println("Door Unlocking...");
+    }
+  }
+
+  // Motor timeout check
+  if (isMotorRunning && (millis() - motorStartTime >= MOTOR_RUN_TIME)) {
+    stopMotor();
+  }
+  
+  updateSleepLED();
+  delay(50);
+}
