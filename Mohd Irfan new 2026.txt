@@ -1,0 +1,686 @@
+#include <EEPROM.h>
+#include <BluetoothSerial.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <DFRobotDFPlayerMini.h>
+#include <esp_sleep.h>
+
+// ================= BLUETOOTH =================
+BluetoothSerial SerialBT;
+
+// ================= WEB SERVER =================
+WebServer server(80);
+
+// ================= TFT =================
+#define TFT_CS     5
+#define TFT_RST    16
+#define TFT_DC     4
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+// ================= MP3 =================
+#define MP3_RX 26
+#define MP3_TX 27
+HardwareSerial mp3Serial(1);
+DFRobotDFPlayerMini myDFPlayer;
+
+// ================= MOTOR =================
+const int MOTOR_IN1 = 12;
+const int MOTOR_IN2 = 17;
+unsigned long MOTOR_RUN_TIME = 800;
+
+// ================= BUTTONS =================
+const int BTN_UNLOCK_PIN = 32;
+const int BTN_LOCK_PIN   = 33;
+
+// ================= LEDs =================
+const int LED_RED_PIN   = 13;
+const int LED_GREEN_PIN = 2;
+const int LED_BLUE_PIN  = 15;
+
+// ================= BUZZER =================
+const int BUZZER_PIN = 19;
+
+// ================= EEPROM =================
+#define EEPROM_SIZE 256
+#define EEPROM_ADDR_MOTOR_TIME 0
+#define DOOR_STATE_ADDR 8
+#define EEPROM_MAGIC_ADDR 12
+#define EEPROM_PASS_ADDR 16
+#define EEPROM_SLEEP_TIME_ADDR 40
+#define EEPROM_WIFI_PASS_ADDR 50
+#define EEPROM_WIFI_SSID_ADDR 80
+#define EEPROM_MAGIC 0x5A
+
+bool doorUnlocked = false;
+
+// ================= PASSWORD =================
+String correctPassword = "1234";
+bool authenticated = false;
+unsigned long authStartTime = 0;
+const unsigned long PASSWORD_TIME = 300000UL;
+
+// ================= WIFI =================
+String wifiSSID = "ESP32_DoorLock";
+String wifiPassword = "12345678";
+
+// ================= MOTOR STATE =================
+bool motorRunning = false;
+unsigned long motorStartTime = 0;
+bool motorDirectionLock = false;
+
+// ================= SLEEP MODE =================
+bool isSleepMode = false;
+unsigned long lastActivityTime = 0;
+unsigned long SLEEP_TIMEOUT = 300000;
+
+// =================================================
+// DISPLAY
+// =================================================
+void showStatus(String line1, String line2) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setCursor(10, 30);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.println(line1);
+  tft.setCursor(10, 60);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.println(line2);
+}
+
+void showDoorState() {
+  if (doorUnlocked) showStatus("UNLOCKED", "Door is Open");
+  else showStatus("LOCKED", "Door is Closed");
+}
+
+// =================================================
+// MP3
+// =================================================
+void playSound(int track) {
+  if (myDFPlayer.available()) myDFPlayer.play(track);
+}
+
+// =================================================
+// BUZZER
+// =================================================
+
+// 2 tik tik (correct password / wrong lock-unlock)
+void beep2Tik() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// 3 tik tik (correct lock/unlock)
+void beep3Tik() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// 3 fast beeps (wrong password)
+void beepWrong() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(150);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+}
+
+// 1 long beep (on/off, sleep/wake)
+void beepSleep() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(500);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// =================================================
+// MOTOR
+// =================================================
+void stopMotor() {
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+  motorRunning = false;
+}
+
+void startMotor(bool isLock) {
+  if (isLock) {
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, HIGH);
+    motorDirectionLock = true;
+    showStatus("LOCKING...", "");
+    playSound(2);
+  } else {
+    digitalWrite(MOTOR_IN1, HIGH);
+    digitalWrite(MOTOR_IN2, LOW);
+    motorDirectionLock = false;
+    showStatus("UNLOCKING...", "");
+    playSound(1);
+  }
+  motorStartTime = millis();
+  motorRunning = true;
+  lastActivityTime = millis();
+}
+
+// =================================================
+// EEPROM
+// =================================================
+void saveDoorState() {
+  EEPROM.write(DOOR_STATE_ADDR, doorUnlocked ? 1 : 0);
+  EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+  EEPROM.commit();
+}
+
+void saveMotorTime() {
+  EEPROM.put(EEPROM_ADDR_MOTOR_TIME, MOTOR_RUN_TIME);
+  EEPROM.commit();
+}
+
+void saveSleepTime() {
+  EEPROM.put(EEPROM_SLEEP_TIME_ADDR, SLEEP_TIMEOUT);
+  EEPROM.commit();
+}
+
+void savePassword(String pass) {
+  for (int i = 0; i < pass.length() && i < 20; i++) {
+    EEPROM.write(EEPROM_PASS_ADDR + i, pass[i]);
+  }
+  EEPROM.write(EEPROM_PASS_ADDR + pass.length(), '\0');
+  EEPROM.commit();
+}
+
+void saveWifiPassword(String pass) {
+  for (int i = 0; i < pass.length() && i < 20; i++) {
+    EEPROM.write(EEPROM_WIFI_PASS_ADDR + i, pass[i]);
+  }
+  EEPROM.write(EEPROM_WIFI_PASS_ADDR + pass.length(), '\0');
+  EEPROM.commit();
+}
+
+void saveWifiSSID(String ssid) {
+  for (int i = 0; i < ssid.length() && i < 20; i++) {
+    EEPROM.write(EEPROM_WIFI_SSID_ADDR + i, ssid[i]);
+  }
+  EEPROM.write(EEPROM_WIFI_SSID_ADDR + ssid.length(), '\0');
+  EEPROM.commit();
+}
+
+String loadPassword() {
+  String pass = "";
+  for (int i = 0; i < 20; i++) {
+    char c = EEPROM.read(EEPROM_PASS_ADDR + i);
+    if (c == '\0' || c == 255) break;
+    pass += c;
+  }
+  if (pass.length() == 0) {
+    pass = "1234";
+    savePassword(pass);
+  }
+  return pass;
+}
+
+String loadWifiPassword() {
+  String pass = "";
+  for (int i = 0; i < 20; i++) {
+    char c = EEPROM.read(EEPROM_WIFI_PASS_ADDR + i);
+    if (c == '\0' || c == 255) break;
+    pass += c;
+  }
+  if (pass.length() < 8) {
+    pass = "12345678";
+    saveWifiPassword(pass);
+  }
+  return pass;
+}
+
+String loadWifiSSID() {
+  String s = "";
+  for (int i = 0; i < 20; i++) {
+    char c = EEPROM.read(EEPROM_WIFI_SSID_ADDR + i);
+    if (c == '\0' || c == 255) break;
+    s += c;
+  }
+  if (s.length() == 0) {
+    s = "ESP32_DoorLock";
+    saveWifiSSID(s);
+  }
+  return s;
+}
+
+void loadDoorState() {
+  byte magic = EEPROM.read(EEPROM_MAGIC_ADDR);
+  if (magic != EEPROM_MAGIC) {
+    doorUnlocked = false;
+    saveDoorState();
+  } else {
+    doorUnlocked = EEPROM.read(DOOR_STATE_ADDR) == 1;
+  }
+  EEPROM.get(EEPROM_ADDR_MOTOR_TIME, MOTOR_RUN_TIME);
+  if (MOTOR_RUN_TIME < 100 || MOTOR_RUN_TIME > 60000) {
+    MOTOR_RUN_TIME = 800;
+    saveMotorTime();
+  }
+  EEPROM.get(EEPROM_SLEEP_TIME_ADDR, SLEEP_TIMEOUT);
+  if (SLEEP_TIMEOUT < 10000 || SLEEP_TIMEOUT > 3600000) {
+    SLEEP_TIMEOUT = 300000;
+    saveSleepTime();
+  }
+  correctPassword = loadPassword();
+  wifiPassword = loadWifiPassword();
+  wifiSSID = loadWifiSSID();
+}
+
+// =================================================
+// LEDs
+// =================================================
+void updateLEDs() {
+  if (doorUnlocked) {
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
+  } else {
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+  }
+  digitalWrite(LED_BLUE_PIN, SerialBT.hasClient() ? HIGH : LOW);
+}
+
+// =================================================
+// SLEEP MODE
+// =================================================
+void enterSleepMode() {
+  if (motorRunning) return;
+
+  Serial.println("Entering Sleep Mode...");
+  beepSleep();
+
+  stopMotor();
+  digitalWrite(LED_RED_PIN, LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
+  digitalWrite(LED_BLUE_PIN, HIGH);
+
+  isSleepMode = true;
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_LOCK_PIN, LOW);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_UNLOCK_PIN, LOW);
+
+  delay(100);
+  esp_light_sleep_start();
+}
+
+void wakeFromSleep() {
+  Serial.println("Waking up...");
+  beepSleep();
+
+  isSleepMode = false;
+  lastActivityTime = millis();
+  authenticated = false;
+
+  digitalWrite(LED_BLUE_PIN, LOW);
+  updateLEDs();
+  showDoorState();
+  Serial.println("Device Woke Up!");
+}
+
+// =================================================
+// WEB PAGE
+// =================================================
+String getHTML() {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin-top:30px;background:#f0f0f0;}";
+  html += "h1{color:#333;} .status{font-size:24px;margin:20px;}";
+  html += ".box{margin:20px auto;padding:20px;background:white;border-radius:12px;max-width:350px;box-shadow:0 2px 8px rgba(0,0,0,0.1);}";
+  html += ".box h3{margin:0 0 10px 0;color:#333;font-size:18px;}";
+  html += "input{padding:12px;font-size:18px;width:150px;text-align:center;border:2px solid #ddd;border-radius:8px;}";
+  html += ".set-btn{padding:12px 25px;font-size:18px;background:#3498db;color:white;border:none;border-radius:8px;cursor:pointer;margin-top:10px;}";
+  html += ".btn{padding:20px 40px;font-size:20px;margin:10px;border:none;border-radius:12px;color:white;cursor:pointer;}";
+  html += ".lock{background:#e74c3c;} .unlock{background:#2ecc71;}";
+  html += "</style></head><body>";
+  
+  html += "<h1>ESP32 Door Lock</h1>";
+  html += "<div class='status'>Status: <b>" + String(doorUnlocked ? "UNLOCKED" : "LOCKED") + "</b></div>";
+
+  html += "<div class='box'><h3>Motor Time: " + String(MOTOR_RUN_TIME) + " ms</h3>";
+  html += "<form action='/settime' method='GET'>";
+  html += "<input type='number' name='time' value='" + String(MOTOR_RUN_TIME) + "' min='100' max='60000'>";
+  html += "<br><button type='submit' class='set-btn'>SET TIME</button></form></div>";
+
+  html += "<div class='box'><h3>Sleep Time: " + String(SLEEP_TIMEOUT) + " ms</h3>";
+  html += "<form action='/setsleep' method='GET'>";
+  html += "<input type='number' name='sleep' value='" + String(SLEEP_TIMEOUT) + "' min='10000' max='3600000'>";
+  html += "<br><button type='submit' class='set-btn'>SET SLEEP</button></form></div>";
+
+  // WiFi Password Change Box (Hidden)
+  html += "<div class='box'><h3>WiFi Password</h3>";
+  html += "<form action='/setwifipass' method='GET'>";
+  html += "<input type='password' name='wifipass' value=''>";
+  html += "<br><button type='submit' class='set-btn'>SET WIFI PASS</button></form></div>";
+
+  // Bluetooth Password Change Box (Hidden)
+  html += "<div class='box'><h3>Bluetooth Password</h3>";
+  html += "<form action='/setbtpass' method='GET'>";
+  html += "<input type='password' name='btpass' value=''>";
+  html += "<br><button type='submit' class='set-btn'>SET BT PASS</button></form></div>";
+
+  html += "<a href='/lock'><button class='btn lock'>LOCK</button></a>";
+  html += "<a href='/unlock'><button class='btn unlock'>UNLOCK</button></a>";
+  
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() { lastActivityTime = millis(); server.send(200, "text/html", getHTML()); }
+
+void handleLock() {
+  lastActivityTime = millis();
+  if (!motorRunning && doorUnlocked == true) {
+    startMotor(true);
+  } else {
+    beep2Tik();
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleUnlock() {
+  lastActivityTime = millis();
+  if (!motorRunning && doorUnlocked == false) {
+    startMotor(false);
+  } else {
+    beep2Tik();
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleSetTime() {
+  lastActivityTime = millis();
+  if (server.hasArg("time")) {
+    int newTime = server.arg("time").toInt();
+    if (newTime >= 100 && newTime <= 60000) { MOTOR_RUN_TIME = newTime; saveMotorTime(); }
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+void handleSetSleep() {
+  lastActivityTime = millis();
+  if (server.hasArg("sleep")) {
+    unsigned long newSleep = server.arg("sleep").toInt();
+    if (newSleep >= 10000 && newSleep <= 3600000) {
+      SLEEP_TIMEOUT = newSleep;
+      saveSleepTime();
+    }
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+// UPDATED: WiFi Password Change with Success/Error Message
+void handleSetWifiPass() {
+  lastActivityTime = millis();
+  if (server.hasArg("wifipass")) {
+    String newWifiPass = server.arg("wifipass");
+    if (newWifiPass.length() >= 8 && newWifiPass.length() < 20) {
+      wifiPassword = newWifiPass;
+      saveWifiPassword(newWifiPass);
+      server.send(200, "text/html", "<html><body style='text-align:center;font-family:Arial;padding:50px;'><h2 style='color:green;'>WiFi Password Saved!</h2><p>Please restart ESP32 (Press EN/RST button).</p><a href='/'>Go Back</a></body></html>");
+      return;
+    } else {
+      server.send(200, "text/html", "<html><body style='text-align:center;font-family:Arial;padding:50px;'><h2 style='color:red;'>Error: Password must be 8-20 characters!</h2><a href='/'>Go Back</a></body></html>");
+      return;
+    }
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+// UPDATED: Bluetooth Password Change with Success/Error Message
+void handleSetBtPass() {
+  lastActivityTime = millis();
+  if (server.hasArg("btpass")) {
+    String newBtPass = server.arg("btpass");
+    if (newBtPass.length() > 0 && newBtPass.length() < 20) {
+      correctPassword = newBtPass;
+      savePassword(newBtPass);
+      server.send(200, "text/html", "<html><body style='text-align:center;font-family:Arial;padding:50px;'><h2 style='color:green;'>Bluetooth Password Saved!</h2><p>No restart required.</p><a href='/'>Go Back</a></body></html>");
+      return;
+    } else {
+      server.send(200, "text/html", "<html><body style='text-align:center;font-family:Arial;padding:50px;'><h2 style='color:red;'>Error: Password must be 1-19 characters!</h2><a href='/'>Go Back</a></body></html>");
+      return;
+    }
+  }
+  server.sendHeader("Location", "/"); server.send(303);
+}
+
+// =================================================
+// SETUP
+// =================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadDoorState();
+
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  stopMotor();
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_BLUE_PIN, OUTPUT);
+
+  pinMode(BTN_UNLOCK_PIN, INPUT_PULLUP);
+  pinMode(BTN_LOCK_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  updateLEDs();
+
+  // TFT
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  showStatus("HOME DOOR LOCK", "Starting...");
+
+  // MP3
+  mp3Serial.begin(9600, SERIAL_8N1, MP3_RX, MP3_TX);
+  if (!myDFPlayer.begin(mp3Serial)) {
+    showStatus("MP3 ERROR", "Check Wiring");
+  } else {
+    myDFPlayer.volume(20);
+  }
+
+  // WiFi + Web Server
+  WiFi.softAP(wifiSSID.c_str(), wifiPassword.c_str());
+  Serial.print("WiFi AP Started. IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("WiFi SSID: ");
+  Serial.println(wifiSSID);
+  Serial.print("WiFi Password: ");
+  Serial.println(wifiPassword);
+
+  server.on("/", handleRoot);
+  server.on("/lock", handleLock);
+  server.on("/unlock", handleUnlock);
+  server.on("/settime", handleSetTime);
+  server.on("/setsleep", handleSetSleep);
+  server.on("/setwifipass", handleSetWifiPass);
+  server.on("/setbtpass", handleSetBtPass);
+  server.begin();
+
+  // Classic Bluetooth
+  SerialBT.begin("IRFAN DOOR LOCK");
+
+  lastActivityTime = millis();
+  showDoorState();
+  Serial.println("System Ready!");
+  
+  beepSleep();
+}
+
+// =================================================
+// LOOP
+// =================================================
+void loop() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+    wakeFromSleep();
+  }
+
+  server.handleClient();
+
+  if (!isSleepMode && !motorRunning && (millis() - lastActivityTime > SLEEP_TIMEOUT)) {
+    enterSleepMode();
+  }
+
+  if (SerialBT.available()) {
+    String command = SerialBT.readStringUntil('\n');
+    command.trim();
+    lastActivityTime = millis();
+
+    Serial.print("BT: ");
+    Serial.println(command);
+
+    // SAHI PASSWORD
+    if (command == correctPassword) {
+      authenticated = true;
+      authStartTime = millis();
+      SerialBT.println("AUTH_SUCCESS");
+      beep2Tik();
+    }
+    // GALAT PASSWORD
+    else if (command.length() > 0 && command != correctPassword && command != "LOCK" && command != "UNLOCK" 
+             && !command.startsWith("NEWPASS:") && !command.startsWith("WIFIPASS:") 
+             && !command.startsWith("WIFISSID:") && !command.startsWith("TIME:") 
+             && !command.startsWith("SLEEPTIME:") && command != "SLEEP") {
+      if (!authenticated) {
+        SerialBT.println("WRONG PASSWORD");
+        beepWrong();
+      }
+    }
+    // NEW BLUETOOTH PASSWORD
+    else if (command.startsWith("NEWPASS:") && authenticated) {
+      String newPass = command.substring(8);
+      newPass.trim();
+      if (newPass.length() > 0 && newPass.length() < 20) {
+        correctPassword = newPass;
+        savePassword(newPass);
+        SerialBT.println("PASSWORD CHANGED");
+        beep2Tik();
+      }
+    }
+    // NEW WIFI PASSWORD
+    else if (command.startsWith("WIFIPASS:") && authenticated) {
+      String newWifiPass = command.substring(9);
+      newWifiPass.trim();
+      if (newWifiPass.length() >= 8 && newWifiPass.length() < 20) {
+        wifiPassword = newWifiPass;
+        saveWifiPassword(newWifiPass);
+        SerialBT.println("WIFI PASSWORD CHANGED. RESTART REQUIRED.");
+        beep2Tik();
+      } else {
+        SerialBT.println("MIN 8 CHARACTERS REQUIRED");
+        beepWrong();
+      }
+    }
+    // NEW WIFI SSID
+    else if (command.startsWith("WIFISSID:") && authenticated) {
+      String newSSID = command.substring(9);
+      newSSID.trim();
+      if (newSSID.length() > 0 && newSSID.length() < 20) {
+        wifiSSID = newSSID;
+        saveWifiSSID(newSSID);
+        SerialBT.println("WIFI SSID CHANGED. RESTART REQUIRED.");
+        beep2Tik();
+      } else {
+        SerialBT.println("INVALID SSID");
+        beepWrong();
+      }
+    }
+    else if (command.startsWith("TIME:") && authenticated) {
+      int newTime = command.substring(5).toInt();
+      if (newTime >= 100 && newTime <= 60000) {
+        MOTOR_RUN_TIME = newTime;
+        saveMotorTime();
+        SerialBT.println("TIME SET");
+        beep2Tik();
+      }
+    }
+    else if (command.startsWith("SLEEPTIME:") && authenticated) {
+      unsigned long newSleep = command.substring(10).toInt();
+      if (newSleep >= 10000 && newSleep <= 3600000) {
+        SLEEP_TIMEOUT = newSleep;
+        saveSleepTime();
+        SerialBT.println("SLEEP TIME SET");
+        beep2Tik();
+      }
+    }
+    else if (command == "SLEEP" && authenticated) {
+      SerialBT.println("GOING TO SLEEP...");
+      enterSleepMode();
+    }
+    else if (command == "LOCK" && authenticated) {
+      if (!motorRunning && doorUnlocked == true) {
+        startMotor(true);
+        SerialBT.println("LOCKING...");
+      } else {
+        SerialBT.println("ALREADY LOCKED or BUSY");
+        beep2Tik();
+      }
+    }
+    else if (command == "UNLOCK" && authenticated) {
+      if (!motorRunning && doorUnlocked == false) {
+        startMotor(false);
+        SerialBT.println("UNLOCKING...");
+      } else {
+        SerialBT.println("ALREADY UNLOCKED or BUSY");
+        beep2Tik();
+      }
+    }
+    else {
+      SerialBT.println("UNKNOWN COMMAND");
+      beepWrong();
+    }
+  }
+
+  // LOCK/UNLOCK COMPLETE
+  if (motorRunning && (millis() - motorStartTime >= MOTOR_RUN_TIME)) {
+    stopMotor();
+    if (motorDirectionLock) doorUnlocked = false;
+    else doorUnlocked = true;
+    saveDoorState();
+    updateLEDs();
+    showDoorState();
+    beep3Tik();
+    lastActivityTime = millis();
+  }
+
+  // Physical UNLOCK Button
+  if (digitalRead(BTN_UNLOCK_PIN) == LOW && !motorRunning) {
+    lastActivityTime = millis();
+    if (doorUnlocked == false) {
+      startMotor(false);
+    } else {
+      beep2Tik();
+    }
+  }
+
+  // Physical LOCK Button
+  if (digitalRead(BTN_LOCK_PIN) == LOW && !motorRunning) {
+    lastActivityTime = millis();
+    if (doorUnlocked == true) {
+      startMotor(true);
+    } else {
+      beep2Tik();
+    }
+  }
+
+  delay(10);
+}
